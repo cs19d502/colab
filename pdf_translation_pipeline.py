@@ -35,12 +35,19 @@ dependencies cannot be installed and the script cannot be exercised end-to-end
 here.  The implementation nevertheless contains all the necessary plumbing to
 perform the task once the required libraries are available in the runtime
 environment.
+
+When Docling itself cannot be imported, the extractor can fall back to JSON
+annotations saved alongside the PDF (``brochure.docling.json``) or provided
+explicitly via the ``--docling-json`` CLI option.  This makes it possible to
+exercise the pipeline logic in constrained environments while still
+round-tripping realistic brochure layouts in tests.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
@@ -110,9 +117,27 @@ class DoclingExtractor:
     the translated PDF.
     """
 
-    def __init__(self, use_ocr: bool = False) -> None:
+    def __init__(
+        self,
+        use_ocr: bool = False,
+        pipeline: Optional[Any] = None,
+        fallback_to_json: bool = True,
+    ) -> None:
         self._use_ocr = use_ocr
-        self._pipeline = self._build_pipeline(use_ocr)
+        self._fallback_to_json = fallback_to_json
+        if pipeline is not None:
+            self._pipeline = pipeline
+            return
+
+        try:
+            self._pipeline = self._build_pipeline(use_ocr)
+        except RuntimeError:
+            if not fallback_to_json:
+                raise
+            LOGGER.warning(
+                "Docling pipeline unavailable; falling back to JSON annotations when provided."
+            )
+            self._pipeline = None
 
     @staticmethod
     def _build_pipeline(use_ocr: bool) -> Any:
@@ -149,12 +174,17 @@ class DoclingExtractor:
             "Install Docling from source and make sure it is importable."
         ) from last_error
 
-    def extract(self, pdf_path: Path) -> Tuple[List[DocumentComponent], Dict[int, PageLayout]]:
+    def extract(
+        self, pdf_path: Path, docling_json: Optional[Path] = None
+    ) -> Tuple[List[DocumentComponent], Dict[int, PageLayout]]:
         """Extract components and page layouts from ``pdf_path``."""
 
-        LOGGER.info("Running Docling pipeline on %s", pdf_path)
-        document = self._pipeline.run(str(pdf_path))
-        document_dict = self._normalise_docling_object(document)
+        if self._pipeline is not None:
+            LOGGER.info("Running Docling pipeline on %s", pdf_path)
+            document = self._pipeline.run(str(pdf_path))
+            document_dict = self._normalise_docling_object(document)
+        else:
+            document_dict = self._load_docling_json(pdf_path, docling_json)
         page_layouts = self._collect_page_layouts(pdf_path, document_dict)
         annotations = self._collect_docling_annotations(document_dict)
 
@@ -231,8 +261,78 @@ class DoclingExtractor:
         for index, page in enumerate(pages):
             width = float(page.get("width") or page.get("page_width") or 595.0)
             height = float(page.get("height") or page.get("page_height") or 842.0)
-            layouts[index + 1] = PageLayout(width, height, (1.0, 1.0, 1.0))
+            background = (
+                DoclingExtractor._extract_background_from_dict(page)
+                or (1.0, 1.0, 1.0)
+            )
+            layouts[index + 1] = PageLayout(width, height, background)
         return layouts
+
+    @staticmethod
+    def _default_json_candidates(pdf_path: Path) -> List[Path]:
+        stem = pdf_path.stem
+        parent = pdf_path.parent
+        return [
+            parent / f"{stem}.docling.json",
+            parent / f"{stem}.json",
+        ]
+
+    def _load_docling_json(
+        self, pdf_path: Path, explicit_path: Optional[Path]
+    ) -> Dict[str, Any]:
+        candidates: List[Path] = []
+        if explicit_path is not None:
+            candidates.append(explicit_path)
+        if self._fallback_to_json:
+            candidates.extend(self._default_json_candidates(pdf_path))
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if candidate.exists():
+                LOGGER.info("Loading Docling annotations from %s", candidate)
+                with candidate.open("r", encoding="utf-8") as handle:
+                    return json.load(handle)
+
+        raise RuntimeError(
+            "Docling pipeline is unavailable and no JSON annotations were found."
+        )
+
+    @staticmethod
+    def _extract_background_from_dict(
+        page: Dict[str, Any]
+    ) -> Optional[Tuple[float, float, float]]:
+        colour_sources = [
+            page.get("background_color"),
+            page.get("background"),
+            page.get("bg_color"),
+        ]
+        for source in colour_sources:
+            colour = DoclingExtractor._normalise_colour(source)
+            if colour is not None:
+                return colour
+        return None
+
+    @staticmethod
+    def _normalise_colour(colour: Any) -> Optional[Tuple[float, float, float]]:
+        if colour is None:
+            return None
+        if isinstance(colour, dict):
+            candidates = [("r", "g", "b"), ("red", "green", "blue")]
+            for keys in candidates:
+                if all(key in colour for key in keys):
+                    values = [float(colour[key]) for key in keys]
+                    return DoclingExtractor._normalise_colour_values(values)
+        if isinstance(colour, (list, tuple)) and len(colour) >= 3:
+            values = [float(colour[0]), float(colour[1]), float(colour[2])]
+            return DoclingExtractor._normalise_colour_values(values)
+        return None
+
+    @staticmethod
+    def _normalise_colour_values(values: Sequence[float]) -> Tuple[float, float, float]:
+        if any(value > 1.5 for value in values):
+            values = [value / 255.0 for value in values]
+        return tuple(max(0.0, min(1.0, value)) for value in values)  # type: ignore[return-value]
 
     @staticmethod
     def _extract_background_colour(page: Any) -> Tuple[float, float, float]:
@@ -582,14 +682,27 @@ def translate_pdf(
     model: str,
     tokenizer: Optional[str] = None,
     use_ocr: bool = False,
+    extractor: Optional["DoclingExtractor"] = None,
+    translator: Optional[Any] = None,
+    renderer: Optional[Any] = None,
+    docling_json: Optional[Path] = None,
 ) -> None:
     """High-level helper that glues the extractor, translator, and renderer."""
 
-    extractor = DoclingExtractor(use_ocr=use_ocr)
-    components, layouts = extractor.extract(input_pdf)
-    translator = VLLMTranslator(model=model, tokenizer=tokenizer, target_language=language)
-    translated_components = [translator.translate_component(component) for component in components]
-    renderer = ReportLabRenderer()
+    if extractor is None:
+        extractor = DoclingExtractor(use_ocr=use_ocr)
+    components, layouts = extractor.extract(input_pdf, docling_json=docling_json)
+
+    if translator is None:
+        translator = VLLMTranslator(
+            model=model, tokenizer=tokenizer, target_language=language
+        )
+    translated_components = [
+        translator.translate_component(component) for component in components
+    ]
+
+    if renderer is None:
+        renderer = ReportLabRenderer()
     renderer.render(translated_components, layouts, output_pdf)
     LOGGER.info("Translated PDF written to %s", output_pdf)
 
@@ -618,6 +731,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Enable Docling OCR processing pipeline",
     )
     parser.add_argument(
+        "--docling-json",
+        type=Path,
+        help="Optional Docling annotations exported to JSON",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
@@ -637,6 +755,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         model=args.model,
         tokenizer=args.tokenizer,
         use_ocr=args.ocr,
+        docling_json=args.docling_json,
     )
 
 
